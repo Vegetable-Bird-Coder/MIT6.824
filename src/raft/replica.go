@@ -109,6 +109,7 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 	}
 }
 
+// Process log replication in batches instead of handling it each time a log is appended
 func (rf *Raft) replicator(peer int) {
 	rf.replicatorCond[peer].L.Lock()
 	defer rf.replicatorCond[peer].L.Unlock()

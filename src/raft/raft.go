@@ -255,6 +255,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[i] = lastLogIndex + 1
 		if i != rf.me {
 			rf.replicatorCond[i] = sync.NewCond(&sync.Mutex{})
+			// replicate logs
 			go rf.replicator(i)
 		}
 
@@ -266,6 +267,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	// apply commited logs
 	go rf.applier()
 
 	return rf
