@@ -32,6 +32,8 @@ func (rf *Raft) AppendEntries(req *AppendEntriesReq, res *AppendEntriesRes) {
 		return
 	}
 
+	defer rf.persist()
+
 	if req.Term > rf.currentTerm {
 		rf.currentTerm = req.Term
 		rf.votedFor = -1
@@ -158,6 +160,7 @@ func (rf *Raft) handleAppendEntriesRes(peer int, req *AppendEntriesReq, res *App
 		rf.votedFor = -1
 		rf.currentTerm = res.Term
 		rf.resetElectionTimeout()
+		rf.persist()
 		return
 	}
 
