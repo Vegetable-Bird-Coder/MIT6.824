@@ -61,6 +61,11 @@ func (rf *Raft) getLastLogIndex() int {
 	return rf.log[len(rf.log)-1].Index
 }
 
+func (rf *Raft) appendLogEntry(command interface{}) *LogEntry {
+	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm, Index: rf.getLastLogIndex() + 1})
+	return rf.getLastLogEntry()
+}
+
 func (rf *Raft) resetElectionTimeout() {
 	if rf.electionTimer == nil {
 		rf.electionTimer = time.NewTimer(time.Duration(300+rand.Intn(200)) * time.Millisecond)
@@ -76,4 +81,18 @@ func (rf *Raft) resetHeartbeat() {
 	} else {
 		rf.heartbeatTimer.Reset(time.Duration(150) * time.Millisecond)
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

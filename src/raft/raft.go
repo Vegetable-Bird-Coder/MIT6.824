@@ -91,6 +91,10 @@ type Raft struct {
 	state          State
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
+
+	applyCh        chan ApplyMsg
+	applyCond      *sync.Cond   // CV to wake up applier goroutine after committing new entries
+	replicatorCond []*sync.Cond // CVs to signal replicator goroutines to batch replicating entries
 }
 
 // return currentTerm and whether this server
@@ -162,13 +166,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.state != LEADER {
+		return -1, rf.currentTerm, false
+	}
+
+	// Append the new command to the leader's log
+	lastLogEntry := rf.appendLogEntry(command)
+	rf.broadcastAppendEntries(false)
+	return lastLogEntry.Index, lastLogEntry.Term, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -224,22 +233,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	// Your initialization code here (3A, 3B, 3C).
 	rf := &Raft{
-		peers:      peers,
-		persister:  persister,
-		me:         me,
-		votedFor:   -1,
-		log:        make([]LogEntry, 1), // dummy entry
-		nextIndex:  make([]int, len(peers)),
-		matchIndex: make([]int, len(peers)),
-		state:      FOLLOWER,
+		peers:          peers,
+		persister:      persister,
+		me:             me,
+		votedFor:       -1,
+		log:            make([]LogEntry, 1), // dummy entry
+		nextIndex:      make([]int, len(peers)),
+		matchIndex:     make([]int, len(peers)),
+		state:          FOLLOWER,
+		applyCh:        applyCh,
+		replicatorCond: make([]*sync.Cond, len(peers)),
 	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.applyCond = sync.NewCond(&rf.mu)
 	lastLogIndex := rf.getFirstLogIndex()
 	for i := 0; i < len(peers); i++ {
-		rf.matchIndex[i], rf.nextIndex[i] = 0, lastLogIndex+1
+		rf.matchIndex[i] = 0
+		rf.nextIndex[i] = lastLogIndex + 1
+		if i != rf.me {
+			rf.replicatorCond[i] = sync.NewCond(&sync.Mutex{})
+			go rf.replicator(i)
+		}
+
 	}
 
 	rf.resetElectionTimeout()
@@ -248,5 +266,33 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	go rf.applier()
+
 	return rf
+}
+
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+		firstLogIndex := rf.getFirstLogIndex()
+		commitIndex := rf.commitIndex
+		entries := rf.log[rf.lastApplied+1-firstLogIndex : commitIndex+1-firstLogIndex]
+		rf.mu.Unlock()
+
+		for _, entry := range entries {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: entry.Index,
+			}
+			DPrintf("Raft %d applied log index %d command %v\n", rf.me, entry.Index, entry.Command)
+		}
+
+		rf.mu.Lock()
+		rf.lastApplied = max(rf.lastApplied, commitIndex)
+		rf.mu.Unlock()
+	}
 }
