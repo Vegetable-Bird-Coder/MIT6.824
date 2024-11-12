@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"bytes"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,6 +81,7 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
+	snapshot    []byte
 
 	// Volatile state on all servers
 	commitIndex int
@@ -144,7 +146,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = logs
-		DPrintf("Raft %d term %d with %d logs back\n", rf.me, rf.currentTerm, len(rf.log))
+		DPrintf("Reboot Event: %s back\n", rf.getNodeInfo())
 	}
 }
 
@@ -154,7 +156,6 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -182,7 +183,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Append the new command to the leader's log
 	lastLogEntry := rf.appendLogEntry(command)
+	DPrintf("Start Event: %s\n", rf.getNodeInfo())
 	rf.broadcastAppendEntries(false)
+
 	return lastLogEntry.Index, lastLogEntry.Term, true
 }
 
@@ -290,14 +293,18 @@ func (rf *Raft) applier() {
 		entries := rf.log[rf.lastApplied+1-firstLogIndex : commitIndex+1-firstLogIndex]
 		rf.mu.Unlock()
 
+		allCommands := ""
 		for _, entry := range entries {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: entry.Index,
 			}
-			DPrintf("Raft %d applied log index %d command %v\n", rf.me, entry.Index, entry.Command)
+			allCommands += fmt.Sprintf("%v ", entry.Command)
 		}
+
+		DPrintf("Raft %d applied logs from %d to %d\n", rf.me, entries[0].Index, entries[len(entries)-1].Index)
+		DPrintf("Raft %d applied logs commands %s\n", rf.me, allCommands)
 
 		rf.mu.Lock()
 		rf.lastApplied = max(rf.lastApplied, commitIndex)

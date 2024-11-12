@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -81,6 +82,10 @@ func (rf *Raft) resetHeartbeat() {
 	} else {
 		rf.heartbeatTimer.Reset(time.Duration(150) * time.Millisecond)
 	}
+}
+
+func (rf *Raft) getNodeInfo() string {
+	return fmt.Sprintf("Raft %d Term %d with %d logs", rf.me, rf.currentTerm, len(rf.log))
 }
 
 func min(a, b int) int {

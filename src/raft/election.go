@@ -57,9 +57,9 @@ func (rf *Raft) RequestVote(req *RequestVoteReq, res *RequestVoteRes) {
 
 	// receive req from lower Term or already voted
 	if req.Term < rf.currentTerm || (req.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != req.CandidateID) {
+		DPrintf("Election Event: %s refuses to vote for Raft %d Term %d - Lower term or already voted\n", rf.getNodeInfo(), req.CandidateID, req.Term)
 		res.Term = rf.currentTerm
 		res.VoteGranted = false
-		DPrintf("Raft %d term %d refuses to vote for Raft %d term %d\n", rf.me, rf.currentTerm, req.CandidateID, req.Term)
 		return
 	}
 
@@ -74,14 +74,14 @@ func (rf *Raft) RequestVote(req *RequestVoteReq, res *RequestVoteRes) {
 
 	if !rf.isLogUpToDate(req.LastLogIndex, req.LastLogTerm) {
 		res.VoteGranted = false
-		DPrintf("Raft %d term %d refuses to vote for Raft %d term %d\n", rf.me, rf.currentTerm, req.CandidateID, req.Term)
+		DPrintf("Election Event: %s refuses to vote for Raft %d Term %d - Log is not up to date\n", rf.getNodeInfo(), req.CandidateID, req.Term)
 		return
 	}
 
 	rf.votedFor = req.CandidateID
 	res.VoteGranted = true
 	rf.resetElectionTimeout()
-	DPrintf("Raft %d term %d votes for Raft %d term %d\n", rf.me, rf.currentTerm, req.CandidateID, req.Term)
+	DPrintf("Election Event: %s votes for Raft %d Term %d\n", rf.getNodeInfo(), req.CandidateID, req.Term)
 }
 
 func (rf *Raft) StartElection() {
@@ -90,7 +90,7 @@ func (rf *Raft) StartElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 
-	DPrintf("Raft %d term %d start election\n", rf.me, rf.currentTerm)
+	DPrintf("Election Event: %s starts election\n", rf.getNodeInfo())
 
 	request := rf.makeRequestVoteReq()
 
@@ -98,6 +98,13 @@ func (rf *Raft) StartElection() {
 	for peer := range rf.peers {
 		if peer != rf.me {
 			go func(peer int) {
+				rf.mu.Lock()
+				if rf.state != CANDIDATE {
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+
 				response := new(RequestVoteRes)
 				if rf.sendRequestVote(peer, request, response) {
 					rf.mu.Lock()
@@ -108,6 +115,9 @@ func (rf *Raft) StartElection() {
 							votes++
 							if votes > len(rf.peers)/2 {
 								rf.state = LEADER
+								for i := range rf.nextIndex {
+									rf.nextIndex[i] = rf.getLastLogIndex() + 1
+								}
 								rf.broadcastAppendEntries(true)
 								rf.resetHeartbeat()
 								rf.persist()

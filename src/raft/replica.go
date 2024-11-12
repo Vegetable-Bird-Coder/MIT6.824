@@ -26,9 +26,9 @@ func (rf *Raft) AppendEntries(req *AppendEntriesReq, res *AppendEntriesRes) {
 	defer rf.mu.Unlock()
 
 	if req.Term < rf.currentTerm {
+		DPrintf("Replica Event: %s refuses entries from Raft %d Term %d - Smaller term\n", rf.getNodeInfo(), req.LeaderID, res.Term)
 		res.Term = rf.currentTerm
 		res.Success = false
-		DPrintf("Raft %d term %d refuses entries from Raft %d term %d: smaller term\n", rf.me, rf.currentTerm, req.LeaderID, res.Term)
 		return
 	}
 
@@ -47,6 +47,8 @@ func (rf *Raft) AppendEntries(req *AppendEntriesReq, res *AppendEntriesRes) {
 		return
 	}
 
+	DPrintf("Replica Event: %s accepts entries from Raft %d Term %d\n", rf.getNodeInfo(), req.LeaderID, req.Term)
+
 	// Append any new entries not already in the log
 	firstLogIndex := rf.getFirstLogIndex()
 	rf.log = rf.log[0 : req.PrevLogIndex-firstLogIndex+1]
@@ -60,7 +62,6 @@ func (rf *Raft) AppendEntries(req *AppendEntriesReq, res *AppendEntriesRes) {
 
 	res.Term = rf.currentTerm
 	res.Success = true
-	DPrintf("Raft %d term %d accepts entries from Raft %d term %d\n", rf.me, rf.currentTerm, req.LeaderID, req.Term)
 }
 
 func (rf *Raft) isAppendEntriesLogConflict(req *AppendEntriesReq, res *AppendEntriesRes) bool {
@@ -69,7 +70,7 @@ func (rf *Raft) isAppendEntriesLogConflict(req *AppendEntriesReq, res *AppendEnt
 		res.XTerm = -1
 		res.XIndex = lastLogIndex
 		res.Success = false
-		DPrintf("Raft %d term %d refuses entries from Raft %d term %d: shorter log\n", rf.me, rf.currentTerm, req.LeaderID, req.Term)
+		DPrintf("Replica Event: %s refuses entries from Raft %d Term %d - Shorter log\n", rf.getNodeInfo(), req.LeaderID, req.Term)
 		return true
 	}
 
@@ -84,7 +85,7 @@ func (rf *Raft) isAppendEntriesLogConflict(req *AppendEntriesReq, res *AppendEnt
 			index--
 		}
 		res.XIndex = index + 1
-		DPrintf("Raft %d term %d refuses entries from Raft %d term %d: conflict term\n", rf.me, rf.currentTerm, req.LeaderID, req.Term)
+		DPrintf("Replica Event: %s refuses entries from Raft %d Term %d - Term confliction\n", rf.getNodeInfo(), req.LeaderID, req.Term)
 		return true
 	}
 
@@ -95,14 +96,14 @@ func (rf *Raft) isAppendEntriesLogConflict(req *AppendEntriesReq, res *AppendEnt
 // Otherwise, wake up replicators.
 func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 	if isHeartbeat {
-		DPrintf("Raft %d term %d starts sending heartbeats\n", rf.me, rf.currentTerm)
+		DPrintf("Heartbeat Event: %s starts sending heartbeats\n", rf.getNodeInfo())
 		for peer := range rf.peers {
 			if peer != rf.me {
 				go rf.replicateOneRound(peer)
 			}
 		}
 	} else {
-		DPrintf("Raft %d term %d starts replicating entry\n", rf.me, rf.currentTerm)
+		// replica
 		for peer := range rf.peers {
 			if peer != rf.me {
 				rf.replicatorCond[peer].Signal()
@@ -119,6 +120,7 @@ func (rf *Raft) replicator(peer int) {
 		for !rf.needReplica(peer) {
 			rf.replicatorCond[peer].Wait()
 		}
+		DPrintf("Replica Event: %s copy data to Raft %d\n", rf.getNodeInfo(), peer)
 		rf.replicateOneRound(peer)
 	}
 }
@@ -132,6 +134,10 @@ func (rf *Raft) needReplica(peer int) bool {
 // Send AppendEntries to peer server once
 func (rf *Raft) replicateOneRound(peer int) {
 	rf.mu.Lock()
+	if rf.state != LEADER { // during broadcast, leader may become follower
+		rf.mu.Unlock()
+		return
+	}
 	req := rf.makeAppendEntriesReq(peer)
 	rf.mu.Unlock()
 	res := new(AppendEntriesRes)
