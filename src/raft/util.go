@@ -39,6 +39,16 @@ func (rf *Raft) makeAppendEntriesReq(peer int) *AppendEntriesReq {
 	}
 }
 
+func (rf *Raft) makeInstallSnapshotReq() *InstallSnapshotReq {
+	return &InstallSnapshotReq{
+		Term:              rf.currentTerm,
+		LeaderID:          rf.me,
+		LastIncludedIndex: rf.getFirstLogIndex(),
+		LastIncludedTerm:  rf.getFirstLogTerm(),
+		Data:              rf.snapshot,
+	}
+}
+
 func (rf *Raft) isLogUpToDate(lastLogIndex, lastLogTerm int) bool {
 	lastLogEntry := rf.getLastLogEntry()
 	lastIndex := lastLogEntry.Index
@@ -52,6 +62,10 @@ func (rf *Raft) getFirstLogEntry() *LogEntry {
 
 func (rf *Raft) getFirstLogIndex() int {
 	return rf.log[0].Index
+}
+
+func (rf *Raft) getFirstLogTerm() int {
+	return rf.log[0].Term
 }
 
 func (rf *Raft) getLastLogEntry() *LogEntry {

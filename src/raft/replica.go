@@ -16,9 +16,26 @@ type AppendEntriesRes struct {
 	XIndex  int // First index of the conflict term  or index of last entry
 }
 
+type InstallSnapshotReq struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	// Offset            int
+	Data []byte
+	// Done              bool
+}
+
+type InstallSnapshotRes struct {
+	Term int
+}
+
 func (rf *Raft) sendAppendEntries(server int, req *AppendEntriesReq, res *AppendEntriesRes) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", req, res)
-	return ok
+	return rf.peers[server].Call("Raft.AppendEntries", req, res)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, req *InstallSnapshotReq, res *InstallSnapshotRes) bool {
+	return rf.peers[server].Call("Raft.InstallSnapshot", req, res)
 }
 
 func (rf *Raft) AppendEntries(req *AppendEntriesReq, res *AppendEntriesRes) {
@@ -92,6 +109,48 @@ func (rf *Raft) isAppendEntriesLogConflict(req *AppendEntriesReq, res *AppendEnt
 	return false
 }
 
+func (rf *Raft) InstallSnapshot(req *InstallSnapshotReq, res *InstallSnapshotRes) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	res.Term = rf.currentTerm
+
+	if req.Term < rf.currentTerm {
+		return
+	}
+
+	defer rf.persist()
+	rf.votedFor = req.LeaderID
+	rf.currentTerm = req.Term
+	rf.state = FOLLOWER
+	rf.resetElectionTimeout()
+
+	if req.LastIncludedIndex <= rf.commitIndex {
+		return
+	}
+
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      req.Data,
+			SnapshotIndex: req.LastIncludedIndex,
+			SnapshotTerm:  req.LastIncludedTerm,
+		}
+	}()
+
+	if req.LastIncludedIndex > rf.getLastLogIndex() {
+		rf.log = make([]LogEntry, 1)
+	} else {
+		indexInLog := req.LastIncludedIndex - rf.getFirstLogIndex()
+		rf.log = rf.log[indexInLog:]
+	}
+	rf.log[0].Command = nil
+	rf.log[0].Index = req.LastIncludedIndex
+	rf.log[0].Term = req.LastIncludedTerm
+	rf.lastApplied = req.LastIncludedIndex
+	rf.commitIndex = req.LastIncludedIndex
+}
+
 // If it's a heartbeat, broadcast AppendEntries directly.
 // Otherwise, wake up replicators.
 func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
@@ -138,14 +197,27 @@ func (rf *Raft) replicateOneRound(peer int) {
 		rf.mu.Unlock()
 		return
 	}
-	req := rf.makeAppendEntriesReq(peer)
-	rf.mu.Unlock()
-	res := new(AppendEntriesRes)
 
-	if rf.sendAppendEntries(peer, req, res) {
-		rf.mu.Lock()
-		rf.handleAppendEntriesRes(peer, req, res)
+	if rf.nextIndex[peer]-1 < rf.getFirstLogIndex() {
+		req := rf.makeInstallSnapshotReq()
 		rf.mu.Unlock()
+		res := new(InstallSnapshotRes)
+
+		if rf.sendInstallSnapshot(peer, req, res) {
+			rf.mu.Lock()
+			rf.handleInstallSnapshotRes(peer, req, res)
+			rf.mu.Unlock()
+		}
+	} else {
+		req := rf.makeAppendEntriesReq(peer)
+		rf.mu.Unlock()
+		res := new(AppendEntriesRes)
+
+		if rf.sendAppendEntries(peer, req, res) {
+			rf.mu.Lock()
+			rf.handleAppendEntriesRes(peer, req, res)
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -221,5 +293,21 @@ func (rf *Raft) updateCommitIndex() {
 			}
 			nextCommitIndex++
 		}
+	}
+}
+
+func (rf *Raft) handleInstallSnapshotRes(peer int, req *InstallSnapshotReq, res *InstallSnapshotRes) {
+	if req.Term != rf.currentTerm {
+		return
+	}
+	if res.Term > rf.currentTerm {
+		rf.currentTerm = res.Term
+		rf.state = FOLLOWER
+		rf.votedFor = -1
+		rf.resetElectionTimeout()
+		rf.persist()
+	} else {
+		rf.matchIndex[peer] = req.LastIncludedIndex
+		rf.nextIndex[peer] = req.LastIncludedIndex + 1
 	}
 }

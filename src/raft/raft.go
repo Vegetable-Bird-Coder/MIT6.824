@@ -156,6 +156,18 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if index <= rf.getFirstLogIndex() {
+		return
+	}
+
+	defer rf.persist()
+	rf.snapshot = snapshot
+	indexInLog := index - rf.getFirstLogIndex()
+	rf.log = rf.log[indexInLog:]
+	rf.log[0].Command = nil
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
