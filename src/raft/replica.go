@@ -49,7 +49,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesReq, res *AppendEntriesRes) {
 		return
 	}
 
-	defer rf.persist()
+	defer rf.persist(false)
 
 	if req.Term > rf.currentTerm {
 		rf.currentTerm = req.Term
@@ -116,16 +116,21 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotReq, res *InstallSnapshotRes
 	res.Term = rf.currentTerm
 
 	if req.Term < rf.currentTerm {
+		DPrintf("Snapshot Event: %s refuses snapshot from Raft %d - Smaller term\n", rf.getNodeInfo(), req.LeaderID)
 		return
 	}
 
-	defer rf.persist()
-	rf.votedFor = req.LeaderID
-	rf.currentTerm = req.Term
+	if req.Term > rf.currentTerm || rf.state == CANDIDATE {
+		rf.votedFor = req.LeaderID
+		rf.currentTerm = req.Term
+		rf.persist(false)
+	}
+
 	rf.state = FOLLOWER
 	rf.resetElectionTimeout()
 
 	if req.LastIncludedIndex <= rf.commitIndex {
+		DPrintf("Snapshot Event: %s refuses snapshot from Raft %d - Out of date\n", rf.getNodeInfo(), req.LeaderID)
 		return
 	}
 
@@ -136,19 +141,23 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotReq, res *InstallSnapshotRes
 			SnapshotIndex: req.LastIncludedIndex,
 			SnapshotTerm:  req.LastIncludedTerm,
 		}
+		DPrintf("Snapshot Event: %s apply snapshot\n", rf.getNodeInfo())
 	}()
 
+	rf.snapshot = req.Data
 	if req.LastIncludedIndex > rf.getLastLogIndex() {
 		rf.log = make([]LogEntry, 1)
 	} else {
 		indexInLog := req.LastIncludedIndex - rf.getFirstLogIndex()
-		rf.log = rf.log[indexInLog:]
+		rf.log = append([]LogEntry(nil), rf.log[indexInLog:]...)
 	}
 	rf.log[0].Command = nil
 	rf.log[0].Index = req.LastIncludedIndex
 	rf.log[0].Term = req.LastIncludedTerm
-	rf.lastApplied = req.LastIncludedIndex
 	rf.commitIndex = req.LastIncludedIndex
+	rf.applyCond.Signal()
+	rf.persist(true)
+	DPrintf("Snapshot Event: %s accepts snapshot from Raft %d\n", rf.getNodeInfo(), req.LeaderID)
 }
 
 // If it's a heartbeat, broadcast AppendEntries directly.
@@ -238,7 +247,7 @@ func (rf *Raft) handleAppendEntriesRes(peer int, req *AppendEntriesReq, res *App
 		rf.votedFor = -1
 		rf.currentTerm = res.Term
 		rf.resetElectionTimeout()
-		rf.persist()
+		rf.persist(false)
 		return
 	}
 
@@ -305,7 +314,7 @@ func (rf *Raft) handleInstallSnapshotRes(peer int, req *InstallSnapshotReq, res 
 		rf.state = FOLLOWER
 		rf.votedFor = -1
 		rf.resetElectionTimeout()
-		rf.persist()
+		rf.persist(false)
 	} else {
 		rf.matchIndex[peer] = req.LastIncludedIndex
 		rf.nextIndex[peer] = req.LastIncludedIndex + 1

@@ -63,7 +63,7 @@ func (rf *Raft) RequestVote(req *RequestVoteReq, res *RequestVoteRes) {
 		return
 	}
 
-	defer rf.persist()
+	defer rf.persist(false)
 
 	if req.Term > rf.currentTerm {
 		rf.state = FOLLOWER
@@ -85,7 +85,7 @@ func (rf *Raft) RequestVote(req *RequestVoteReq, res *RequestVoteRes) {
 }
 
 func (rf *Raft) StartElection() {
-	defer rf.persist()
+	defer rf.persist(false)
 	rf.state = CANDIDATE
 	rf.currentTerm++
 	rf.votedFor = rf.me
@@ -120,14 +120,14 @@ func (rf *Raft) StartElection() {
 								}
 								rf.broadcastAppendEntries(true)
 								rf.resetHeartbeat()
-								rf.persist()
+								rf.persist(false)
 							}
 						} else if response.Term > rf.currentTerm {
 							rf.state = FOLLOWER
 							rf.currentTerm = response.Term
 							rf.votedFor = -1
 							rf.resetElectionTimeout()
-							rf.persist()
+							rf.persist(false)
 						}
 					}
 				}

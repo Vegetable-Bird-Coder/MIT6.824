@@ -99,7 +99,7 @@ func (rf *Raft) resetHeartbeat() {
 }
 
 func (rf *Raft) getNodeInfo() string {
-	return fmt.Sprintf("Raft %d Term %d with %d logs", rf.me, rf.currentTerm, len(rf.log))
+	return fmt.Sprintf("Raft %d Term %d with %d logs(%d snapshot)", rf.me, rf.currentTerm, rf.getLastLogIndex()+1, rf.getFirstLogIndex())
 }
 
 func min(a, b int) int {

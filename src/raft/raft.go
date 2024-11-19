@@ -117,7 +117,7 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
+func (rf *Raft) persist(isSnapshot bool) {
 	// Your code here (3C).
 	buffer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(buffer)
@@ -125,7 +125,11 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.votedFor)
 	encoder.Encode(rf.log)
 	raftState := buffer.Bytes()
-	rf.persister.Save(raftState, nil)
+	if isSnapshot {
+		rf.persister.Save(raftState, rf.snapshot)
+	} else {
+		rf.persister.SaveRaftState(raftState)
+	}
 }
 
 // restore previously persisted state.
@@ -163,10 +167,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	defer rf.persist()
+	DPrintf("Snapshot Event: %s starts snapshot at index %d\n", rf.getNodeInfo(), index)
+	defer rf.persist(true)
 	rf.snapshot = snapshot
 	indexInLog := index - rf.getFirstLogIndex()
-	rf.log = rf.log[indexInLog:]
+	aux := append([]LogEntry(nil), rf.log[indexInLog:]...)
+	rf.log = aux
 	rf.log[0].Command = nil
 }
 
@@ -191,7 +197,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 
-	defer rf.persist()
+	defer rf.persist(false)
 
 	// Append the new command to the leader's log
 	lastLogEntry := rf.appendLogEntry(command)
@@ -258,7 +264,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		persister:      persister,
 		me:             me,
 		votedFor:       -1,
-		log:            make([]LogEntry, 1), // dummy entry
+		log:            make([]LogEntry, 1), // dummy entry, include nil command, snapshotIndex and snapshotTerm
 		nextIndex:      make([]int, len(peers)),
 		matchIndex:     make([]int, len(peers)),
 		state:          FOLLOWER,
@@ -268,9 +274,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	rf.lastApplied = rf.getFirstLogIndex()
+	rf.commitIndex = rf.getFirstLogIndex()
 	rf.applyCond = sync.NewCond(&rf.mu)
-	lastLogIndex := rf.getFirstLogIndex()
+	lastLogIndex := rf.getLastLogIndex()
 	for i := 0; i < len(peers); i++ {
 		rf.matchIndex[i] = 0
 		rf.nextIndex[i] = lastLogIndex + 1
@@ -279,7 +286,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			// replicate logs
 			go rf.replicator(i)
 		}
-
 	}
 
 	rf.resetElectionTimeout()
@@ -301,25 +307,42 @@ func (rf *Raft) applier() {
 			rf.applyCond.Wait()
 		}
 		firstLogIndex := rf.getFirstLogIndex()
-		commitIndex := rf.commitIndex
-		entries := rf.log[rf.lastApplied+1-firstLogIndex : commitIndex+1-firstLogIndex]
-		rf.mu.Unlock()
-
-		allCommands := ""
-		for _, entry := range entries {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      entry.Command,
-				CommandIndex: entry.Index,
+		if rf.lastApplied < firstLogIndex {
+			msg := ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotIndex: firstLogIndex,
+				SnapshotTerm:  rf.getFirstLogTerm(),
 			}
-			allCommands += fmt.Sprintf("%v ", entry.Command)
+			DPrintf("Snapshot Event: %s apply snapshot with Index %d Term %d\n", rf.getNodeInfo(), firstLogIndex, rf.getFirstLogTerm())
+			rf.mu.Unlock()
+
+			rf.applyCh <- msg
+
+			rf.mu.Lock()
+			rf.lastApplied = max(rf.lastApplied, firstLogIndex)
+			rf.mu.Unlock()
+		} else {
+			commitIndex := rf.commitIndex
+			entries := append([]LogEntry(nil), rf.log[rf.lastApplied+1-firstLogIndex:commitIndex+1-firstLogIndex]...)
+			rf.mu.Unlock()
+
+			allCommands := ""
+			for _, entry := range entries {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: entry.Index,
+				}
+				allCommands += fmt.Sprintf("%v ", entry.Command)
+			}
+			DPrintf("Raft %d applied logs from %d to %d\n", rf.me, entries[0].Index, entries[len(entries)-1].Index)
+			DPrintf("Raft %d applied logs commands %s\n", rf.me, allCommands)
+
+			rf.mu.Lock()
+			rf.lastApplied = max(rf.lastApplied, commitIndex)
+			rf.mu.Unlock()
 		}
-
-		DPrintf("Raft %d applied logs from %d to %d\n", rf.me, entries[0].Index, entries[len(entries)-1].Index)
-		DPrintf("Raft %d applied logs commands %s\n", rf.me, allCommands)
-
-		rf.mu.Lock()
-		rf.lastApplied = max(rf.lastApplied, commitIndex)
-		rf.mu.Unlock()
 	}
 }
