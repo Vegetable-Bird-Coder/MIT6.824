@@ -1,12 +1,15 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -18,11 +21,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const ExecuteTimeout = time.Duration(3) * time.Second
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type      OpType
+	Key       string
+	Value     string
+	ClientID  int64
+	CommandID int64
+}
+
+type OpContext struct {
+	commandId int64
+	response  *CommandResponse
 }
 
 type KVServer struct {
@@ -35,19 +49,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
-
-
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-}
-
-func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-}
-
-func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	lastApplied   int
+	stateMachine  KVStateMachine
+	clientsLastOp map[int64]*OpContext
+	responseChans map[int]chan *CommandResponse
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -91,11 +96,114 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.stateMachine = newMemoryKV()
+	kv.clientsLastOp = make(map[int64]*OpContext)
+	kv.responseChans = make(map[int]chan *CommandResponse)
+
+	go kv.applier()
 
 	return kv
+}
+
+func (kv *KVServer) Command(req *CommandRequest, res *CommandResponse) {
+	kv.mu.Lock()
+	if req.Op != OpGet && kv.isDuplicatedOp(req.ClientID, req.CommandID) {
+		response := kv.clientsLastOp[req.ClientID].response
+		res.Value = response.Value
+		res.Error = response.Error
+		DPrintf("Node %d receives duplicate request %s\n", kv.me, req.String())
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{Type: req.Op, Key: req.Key, Value: req.Value, ClientID: req.ClientID, CommandID: req.CommandID}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		res.Error = ErrWrongLeader
+		return
+	}
+	DPrintf("Node %d receives request %s in index %d\n", kv.me, req.String(), index)
+
+	kv.mu.Lock()
+	responseChan := kv.getResponseChan(index)
+	kv.mu.Unlock()
+
+	select {
+	case response := <-responseChan:
+		res.Value = response.Value
+		res.Error = response.Error
+	case <-time.After(ExecuteTimeout):
+		res.Error = ErrExecuteTimeout
+	}
+	DPrintf("Node %d response %s for request %s in index %d\n", kv.me, res.String(), req.String(), index)
+
+	go func() {
+		kv.mu.Lock()
+		close(kv.responseChans[index])
+		delete(kv.responseChans, index)
+		kv.mu.Unlock()
+	}()
+}
+
+func (kv *KVServer) applier() {
+	for !kv.killed() {
+		message := <-kv.applyCh
+		DPrintf("Node %d start to apply message %v\n", kv.me, message)
+		if message.CommandValid {
+			kv.mu.Lock()
+			// skip outdated message
+			if message.CommandIndex <= kv.lastApplied {
+				kv.mu.Unlock()
+				DPrintf("Node %d get out-date message %v\n", kv.me, message)
+				continue
+			}
+			kv.lastApplied = message.CommandIndex
+
+			op := message.Command.(Op)
+
+			var res *CommandResponse
+			if op.Type != OpGet && kv.isDuplicatedOp(op.ClientID, op.CommandID) { // one command may timeout and get the same command next time
+				res = kv.clientsLastOp[op.ClientID].response
+			} else {
+				value, err := kv.updateStateMachine(&op)
+				res = &CommandResponse{Value: value, Error: err}
+				if op.Type != OpGet {
+					kv.clientsLastOp[op.ClientID] = &OpContext{commandId: op.CommandID, response: res}
+				}
+			}
+
+			// DPrintf("Node %d applying message %v\n", kv.me, message)
+			if _, isLeader := kv.rf.GetState(); isLeader {
+				responseChan := kv.getResponseChan(message.CommandIndex)
+				responseChan <- res
+			}
+			// DPrintf("Node %d finish to apply message %v\n", kv.me, message)
+			kv.mu.Unlock()
+		} else if message.SnapshotValid {
+
+		} else {
+			panic(fmt.Sprintf("Unexpected Message %v", message))
+		}
+	}
+}
+
+func (kv *KVServer) isDuplicatedOp(clientID, commandID int64) bool {
+	if opContext, ok := kv.clientsLastOp[clientID]; ok {
+		if opContext.commandId == commandID {
+			return true
+		}
+	}
+	return false
+}
+
+func (kv *KVServer) getResponseChan(index int) chan *CommandResponse {
+	if _, ok := kv.responseChans[index]; !ok {
+		kv.responseChans[index] = make(chan *CommandResponse, 1)
+	}
+	return kv.responseChans[index]
 }
