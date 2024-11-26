@@ -41,6 +41,7 @@ func (rf *Raft) sendInstallSnapshot(server int, req *InstallSnapshotReq, res *In
 func (rf *Raft) AppendEntries(req *AppendEntriesReq, res *AppendEntriesRes) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("Replica Event: %s receives entries from Raft %d Term %d PrevLogIndex %d PrevLogTerm %d\n", rf.getNodeInfo(), req.LeaderID, res.Term, req.PrevLogIndex, req.PrevLogTerm)
 
 	if req.Term < rf.currentTerm {
 		DPrintf("Replica Event: %s refuses entries from Raft %d Term %d - Smaller term\n", rf.getNodeInfo(), req.LeaderID, res.Term)
@@ -74,6 +75,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesReq, res *AppendEntriesRes) {
 	// Update commitIndex if leaderCommit is greater
 	if req.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(req.LeaderCommit, rf.getLastLogIndex())
+		DPrintf("Replica Event: %s updates commitIndex %d\n", rf.getNodeInfo(), rf.commitIndex)
 		rf.applyCond.Signal()
 	}
 
@@ -94,6 +96,10 @@ func (rf *Raft) isAppendEntriesLogConflict(req *AppendEntriesReq, res *AppendEnt
 	// Check if log contains an entry at PrevLogIndex with term matching PrevLogTerm
 	firstLogIndex := rf.getFirstLogIndex()
 	index := req.PrevLogIndex - firstLogIndex
+	if index < 0 {
+		res.Success = false
+		return true
+	}
 	if rf.log[index].Term != req.PrevLogTerm {
 		res.XTerm = rf.log[index].Term
 		res.Success = false
@@ -133,16 +139,6 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotReq, res *InstallSnapshotRes
 		DPrintf("Snapshot Event: %s refuses snapshot from Raft %d - Out of date\n", rf.getNodeInfo(), req.LeaderID)
 		return
 	}
-
-	go func() {
-		rf.applyCh <- ApplyMsg{
-			SnapshotValid: true,
-			Snapshot:      req.Data,
-			SnapshotIndex: req.LastIncludedIndex,
-			SnapshotTerm:  req.LastIncludedTerm,
-		}
-		DPrintf("Snapshot Event: %s apply snapshot\n", rf.getNodeInfo())
-	}()
 
 	rf.snapshot = req.Data
 	if req.LastIncludedIndex > rf.getLastLogIndex() {

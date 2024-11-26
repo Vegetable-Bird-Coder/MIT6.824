@@ -102,6 +102,10 @@ func (rf *Raft) getNodeInfo() string {
 	return fmt.Sprintf("Raft %d Term %d with %d logs(%d snapshot)", rf.me, rf.currentTerm, rf.getLastLogIndex()+1, rf.getFirstLogIndex())
 }
 
+func (rf *Raft) GetStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

@@ -43,6 +43,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 3D:
 	SnapshotValid bool
@@ -274,12 +275,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot = persister.ReadSnapshot()
 	rf.lastApplied = rf.getFirstLogIndex()
 	rf.commitIndex = rf.getFirstLogIndex()
 	rf.applyCond = sync.NewCond(&rf.mu)
 	lastLogIndex := rf.getLastLogIndex()
 	for i := 0; i < len(peers); i++ {
-		rf.matchIndex[i] = 0
+		rf.matchIndex[i] = rf.lastApplied
 		rf.nextIndex[i] = lastLogIndex + 1
 		if i != rf.me {
 			rf.replicatorCond[i] = sync.NewCond(&sync.Mutex{})
@@ -307,6 +309,7 @@ func (rf *Raft) applier() {
 			rf.applyCond.Wait()
 		}
 		firstLogIndex := rf.getFirstLogIndex()
+		DPrintf("Apply Event: %s starts applying with lastApplied %d commitIndex %d firstIndex %d\n", rf.getNodeInfo(), rf.lastApplied, rf.commitIndex, firstLogIndex)
 		if rf.lastApplied < firstLogIndex {
 			msg := ApplyMsg{
 				CommandValid:  false,
@@ -331,9 +334,11 @@ func (rf *Raft) applier() {
 			allCommands := ""
 			for _, entry := range entries {
 				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command:      entry.Command,
-					CommandIndex: entry.Index,
+					CommandValid:  true,
+					SnapshotValid: false,
+					Command:       entry.Command,
+					CommandIndex:  entry.Index,
+					CommandTerm:   entry.Term,
 				}
 				allCommands += fmt.Sprintf("%v ", entry.Command)
 			}
