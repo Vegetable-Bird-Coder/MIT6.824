@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -21,7 +22,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const ExecuteTimeout = time.Duration(3) * time.Second
+const ExecuteTimeout = time.Duration(500) * time.Millisecond
 
 type Op struct {
 	// Your definitions here.
@@ -35,8 +36,8 @@ type Op struct {
 }
 
 type OpContext struct {
-	commandId int64
-	response  *CommandResponse
+	CommandId int64
+	Response  *CommandResponse
 }
 
 type KVServer struct {
@@ -100,9 +101,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.stateMachine = newMemoryKV()
 	kv.clientsLastOp = make(map[int64]*OpContext)
 	kv.responseChans = make(map[int]chan *CommandResponse)
+
+	kv.loadSnapshot(persister.ReadSnapshot())
 
 	go kv.applier()
 
@@ -112,7 +114,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func (kv *KVServer) Command(req *CommandRequest, res *CommandResponse) {
 	kv.mu.Lock()
 	if req.Op != OpGet && kv.isDuplicatedOp(req.ClientID, req.CommandID) {
-		response := kv.clientsLastOp[req.ClientID].response
+		response := kv.clientsLastOp[req.ClientID].Response
 		res.Value = response.Value
 		res.Error = response.Error
 		DPrintf("Node %d receives duplicate request %s\n", kv.me, req.String())
@@ -153,13 +155,13 @@ func (kv *KVServer) Command(req *CommandRequest, res *CommandResponse) {
 func (kv *KVServer) applier() {
 	for !kv.killed() {
 		message := <-kv.applyCh
-		DPrintf("Node %d start to apply message %v\n", kv.me, message)
 		if message.CommandValid {
 			kv.mu.Lock()
+			DPrintf("Node %d applies command %s\n", kv.me, applyMsgToString(&message))
 			// skip outdated message
 			if message.CommandIndex <= kv.lastApplied {
 				kv.mu.Unlock()
-				DPrintf("Node %d get out-date message %v\n", kv.me, message)
+				DPrintf("Node %d gets out-date message %v\n", kv.me, message)
 				continue
 			}
 			kv.lastApplied = message.CommandIndex
@@ -168,24 +170,29 @@ func (kv *KVServer) applier() {
 
 			var res *CommandResponse
 			if op.Type != OpGet && kv.isDuplicatedOp(op.ClientID, op.CommandID) { // one command may timeout and get the same command next time
-				res = kv.clientsLastOp[op.ClientID].response
+				res = kv.clientsLastOp[op.ClientID].Response
 			} else {
 				value, err := kv.updateStateMachine(&op)
 				res = &CommandResponse{Value: value, Error: err}
 				if op.Type != OpGet {
-					kv.clientsLastOp[op.ClientID] = &OpContext{commandId: op.CommandID, response: res}
+					kv.clientsLastOp[op.ClientID] = &OpContext{CommandId: op.CommandID, Response: res}
 				}
 			}
 
-			// DPrintf("Node %d applying message %v\n", kv.me, message)
-			if _, isLeader := kv.rf.GetState(); isLeader {
+			if currentTerm, isLeader := kv.rf.GetState(); isLeader && currentTerm == message.CommandTerm {
 				responseChan := kv.getResponseChan(message.CommandIndex)
 				responseChan <- res
 			}
-			// DPrintf("Node %d finish to apply message %v\n", kv.me, message)
+
+			kv.Snapshot(message.CommandIndex)
+
 			kv.mu.Unlock()
 		} else if message.SnapshotValid {
-
+			kv.mu.Lock()
+			DPrintf("Node %d applies snapshot %s\n", kv.me, applyMsgToString(&message))
+			kv.loadSnapshot(message.Snapshot)
+			kv.lastApplied = message.SnapshotIndex
+			kv.mu.Unlock()
 		} else {
 			panic(fmt.Sprintf("Unexpected Message %v", message))
 		}
@@ -194,7 +201,7 @@ func (kv *KVServer) applier() {
 
 func (kv *KVServer) isDuplicatedOp(clientID, commandID int64) bool {
 	if opContext, ok := kv.clientsLastOp[clientID]; ok {
-		if opContext.commandId == commandID {
+		if opContext.CommandId == commandID {
 			return true
 		}
 	}
@@ -206,4 +213,32 @@ func (kv *KVServer) getResponseChan(index int) chan *CommandResponse {
 		kv.responseChans[index] = make(chan *CommandResponse, 1)
 	}
 	return kv.responseChans[index]
+}
+
+func (kv *KVServer) Snapshot(index int) {
+	if kv.maxraftstate != -1 && kv.rf.GetStateSize() > kv.maxraftstate {
+		buffer := new(bytes.Buffer)
+		encoder := labgob.NewEncoder(buffer)
+		encoder.Encode(kv.stateMachine)
+		encoder.Encode(kv.clientsLastOp)
+		snapshot := buffer.Bytes()
+		kv.rf.Snapshot(index, snapshot)
+	}
+}
+
+func (kv *KVServer) loadSnapshot(data []byte) {
+	kv.stateMachine = newMemoryKV()
+	kv.clientsLastOp = make(map[int64]*OpContext)
+
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+	if decoder.Decode(kv.stateMachine) != nil || decoder.Decode(&kv.clientsLastOp) != nil {
+		DPrintf("read persist error\n")
+	} else {
+		DPrintf("Reboot Event: reload snapshot\n")
+	}
 }

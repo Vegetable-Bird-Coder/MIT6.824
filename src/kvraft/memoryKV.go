@@ -1,5 +1,11 @@
 package kvraft
 
+import (
+	"bytes"
+
+	"6.5840/labgob"
+)
+
 type KVStateMachine interface {
 	Get(key string) (string, Err)
 	Put(key, value string) Err
@@ -41,5 +47,20 @@ func (kv *KVServer) updateStateMachine(op *Op) (string, Err) {
 		return "", kv.stateMachine.Append(op.Key, op.Value)
 	default:
 		return "", ErrWrongOpType
+	}
+}
+
+func (kv *KVServer) loadStateMachine(data []byte) {
+	kv.stateMachine = newMemoryKV()
+
+	if data == nil || len(data) < 1 {
+		return
+	}
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+	if decoder.Decode(kv.stateMachine) != nil {
+		DPrintf("read persist error\n")
+	} else {
+		DPrintf("Reboot Event: reload state machine\n")
 	}
 }
