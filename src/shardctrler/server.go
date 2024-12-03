@@ -1,11 +1,20 @@
 package shardctrler
 
+import (
+	"sync"
+	"time"
 
-import "6.5840/raft"
-import "6.5840/labrpc"
-import "sync"
-import "6.5840/labgob"
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
+)
 
+const ExecuteTimeout = time.Duration(500) * time.Millisecond
+
+type OpContext struct {
+	CommandId int64
+	Response  *CommandResponseAux
+}
 
 type ShardCtrler struct {
 	mu      sync.Mutex
@@ -14,32 +23,73 @@ type ShardCtrler struct {
 	applyCh chan raft.ApplyMsg
 
 	// Your data here.
-
-	configs []Config // indexed by config num
+	lastApplied        int
+	clientsLastOp      map[int64]*OpContext
+	responseChans      map[int]chan *CommandResponseAux
+	configStateMachine ConfigStateMachine
 }
-
 
 type Op struct {
 	// Your data here.
+	Servers   map[int][]string // new GID -> servers mappings, for Join
+	GIDs      []int            // for Leave
+	Shard     int              // for Move
+	GID       int              // for Move
+	Num       int              // desired config number, for Query
+	Op        OpType
+	ClientID  int64
+	CommandID int64
 }
 
+func (sc *ShardCtrler) Command(req *CommandRequest, res *CommandResponse) {
+	sc.mu.Lock()
+	if req.Op != OpQuery && sc.isDuplicatedOp(req.ClientID, req.CommandID) {
+		response := sc.clientsLastOp[req.ClientID].Response
+		res.Config = *response.Config
+		res.Err = response.Err
+		sc.mu.Unlock()
+		return
+	}
+	sc.mu.Unlock()
 
-func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here.
+	op := Op{
+		Servers:   req.Servers,
+		GIDs:      req.GIDs,
+		Shard:     req.Shard,
+		GID:       req.GID,
+		Num:       req.Num,
+		Op:        req.Op,
+		ClientID:  req.ClientID,
+		CommandID: req.CommandID,
+	}
+	index, _, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		res.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("Request Event: Node %d receives request %s in index %d\n", sc.me, req.String(), index)
+
+	sc.mu.Lock()
+	responseChan := sc.getResponseChan(index)
+	sc.mu.Unlock()
+
+	select {
+	case response := <-responseChan:
+		res.Config = *response.Config
+		res.Err = response.Err
+		DPrintf("Response Event: Node %d response %s for request %s in index %d\n", sc.me, response.String(), req.String(), index)
+	case <-time.After(ExecuteTimeout):
+		res.Err = ErrExecuteTimeout
+		DPrintf("Response Event: Node %d response %s for request %s in index %d\n", sc.me, res.Err, req.String(), index)
+	}
+
+	go func() {
+		sc.mu.Lock()
+		close(sc.responseChans[index])
+		delete(sc.responseChans, index)
+		sc.mu.Unlock()
+	}()
 }
-
-func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
-	// Your code here.
-}
-
-func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
-}
-
-func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
-}
-
 
 // the tester calls Kill() when a ShardCtrler instance won't
 // be needed again. you are not required to do anything
@@ -63,14 +113,72 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc := new(ShardCtrler)
 	sc.me = me
 
-	sc.configs = make([]Config, 1)
-	sc.configs[0].Groups = map[int][]string{}
-
 	labgob.Register(Op{})
 	sc.applyCh = make(chan raft.ApplyMsg)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
+	sc.clientsLastOp = make(map[int64]*OpContext)
+	sc.responseChans = make(map[int]chan *CommandResponseAux)
+	sc.configStateMachine = newMemoryConfig()
 
+	go sc.applier()
 	return sc
+}
+
+func (sc *ShardCtrler) applier() {
+	for {
+		message := <-sc.applyCh
+		if message.CommandValid {
+			sc.mu.Lock()
+			sc.lastApplied = message.CommandIndex
+
+			op := message.Command.(Op)
+			res := new(CommandResponseAux)
+			if op.Op != OpQuery && sc.isDuplicatedOp(op.ClientID, op.CommandID) {
+				res = sc.clientsLastOp[op.ClientID].Response
+				DPrintf("Apply Event: Node %d ignores duplicate command %s at index %d\n", sc.me, applyMsgToString(&message), message.CommandIndex)
+			} else {
+				switch op.Op {
+				case OpJoin:
+					res.Err, res.Config = sc.configStateMachine.Join(op.Servers)
+				case OpLeave:
+					res.Err, res.Config = sc.configStateMachine.Leave(op.GIDs)
+				case OpMove:
+					res.Err, res.Config = sc.configStateMachine.Move(op.Shard, op.GID)
+				case OpQuery:
+					res.Err, res.Config = sc.configStateMachine.Query(op.Num)
+				default:
+					res.Err = ErrUnexpectOpType
+				}
+				if op.Op != OpQuery {
+					sc.clientsLastOp[op.ClientID] = &OpContext{op.CommandID, res}
+				}
+				DPrintf("Apply Event: Node %d applies command %s at index %d ending with status %s\n", sc.me, applyMsgToString(&message), message.CommandIndex, res.String())
+			}
+
+			if currentTerm, isLeader := sc.rf.GetState(); isLeader && currentTerm == message.CommandTerm {
+				responseChan := sc.getResponseChan(message.CommandIndex)
+				responseChan <- res
+			}
+
+			sc.mu.Unlock()
+		}
+	}
+}
+
+func (sc *ShardCtrler) isDuplicatedOp(clientID, commandID int64) bool {
+	if opContext, ok := sc.clientsLastOp[clientID]; ok {
+		if opContext.CommandId == commandID {
+			return true
+		}
+	}
+	return false
+}
+
+func (sc *ShardCtrler) getResponseChan(index int) chan *CommandResponseAux {
+	if _, ok := sc.responseChans[index]; !ok {
+		sc.responseChans[index] = make(chan *CommandResponseAux, 1)
+	}
+	return sc.responseChans[index]
 }
