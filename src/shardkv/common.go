@@ -10,13 +10,36 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK                = "OK"
+	ErrNoKey          = "ErrNoKey"
+	ErrWrongOpType    = "ErrWrongOpType"
+	ErrWrongGroup     = "ErrWrongGroup"
+	ErrWrongLeader    = "ErrWrongLeader"
+	ErrExecuteTimeout = "ErrExecuteTimeout"
 )
 
 type Err string
+
+const (
+	OpGet    = "GET"
+	OpPut    = "PUT"
+	OpAppend = "APPEND"
+)
+
+type OpType string
+
+type CommandRequest struct {
+	Op        OpType
+	Key       string
+	Value     string
+	ClientID  int64
+	CommandID int64
+}
+
+type CommandResponse struct {
+	Err   Err
+	Value string
+}
 
 // Put or Append
 type PutAppendArgs struct {
